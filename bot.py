@@ -1,354 +1,120 @@
 import os
-import logging
 import asyncio
-import random
-from datetime import datetime
+import logging
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, 
-    CommandHandler, 
-    MessageHandler, 
-    CallbackQueryHandler, 
-    filters, 
-    ContextTypes
-)
-import google.generativeai as genai
-from motor.motor_asyncio import AsyncIOMotorClient
 
-# Environment Variables Load karna
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.filters import CommandStart, CommandObject
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy import BigInteger, String, Boolean, Numeric, DateTime, ForeignKey, select
+from datetime import datetime
+
 load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./riwaaz_earn.db")
 
-# Logging Optimization
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+class Base(DeclarativeBase):
+    pass
 
-# Configurations
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8722096432:AAHQMo8WMDKvn5GFFVtxUR3eA4HQA8PVx2I")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
-MONGO_URI = os.getenv("MONGO_URI")
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    username: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    first_name: Mapped[str] = mapped_column(String(128))
+    referrer_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    is_suspended: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    wallet: Mapped["Wallet"] = relationship("Wallet", back_populates="user", uselist=False)
 
-# Database Initialization
-if MONGO_URI:
-    cluster = AsyncIOMotorClient(MONGO_URI)
-    db = cluster["dating_bot_db"]
-    users_db = db["users"]
-    logs_db = db["chat_logs"]
-else:
-    logger.warning("⚠️ MONGO_URI environment variable nahi mila. Local memory backup active hai.")
-    users_db = None
+class Wallet(Base):
+    __tablename__ = "wallets"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), unique=True)
+    available_balance: Mapped[float] = mapped_column(Numeric(12, 2), default=0.00)
+    pending_balance: Mapped[float] = mapped_column(Numeric(12, 2), default=0.00)
+    total_earned: Mapped[float] = mapped_column(Numeric(12, 2), default=0.00)
+    user: Mapped["User"] = relationship("User", back_populates="wallet")
 
-# Gemini Engine Setup
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    ai_config = genai.GenerationConfig(
-        max_output_tokens=200,
-        temperature=0.7,
-        top_p=0.9
-    )
-    model = genai.GenerativeModel(
-        model_name="gemini-pro",
-        generation_config=ai_config
-    )
-else:
-    model = None
-    logger.error("❌ GEMINI_API_KEY set nahi hai. AI Fallback system crash ho sakta hai.")
+engine = create_async_engine(DATABASE_URL, echo=False)
+AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
-# Active Memory Management (Fallback for quick runtime actions)
-active_matches = {}  # {user_id: partner_id}
-search_queue = {"Male": [], "Female": [], "Other": []}
-
-# Advertisements Catalog
-ADS_POOL = [
-    "📢 *Sakina Collection:* Instagram aur Facebook par behtareen ethnic wear deals ke liye follow karein! ✨",
-    "📱 *Premium Membership:* Sirf 100 Stars mein poora mahina unlimited audio calls payein! 📞",
-    "🚀 Apne business ka ad yahan lagwane ke liye Admin se contact karein!"
-]
-
-# --- DATABASE PIPELINE HELPERS ---
-async def get_user_profile(user_id, username="Unknown"):
-    if users_db is not None:
-        user = await users_db.find_one({"user_id": user_id})
-        if not user:
-            user = {
-                "user_id": user_id,
-                "username": username,
-                "gender": "Not Specified",
-                "status": "idle",
-                "partner_id": None,
-                "premium": False,
-                "created_at": datetime.utcnow()
-            }
-            await users_db.insert_one(user)
-        return user
-    else:
-        return {"user_id": user_id, "gender": "Not Specified", "status": "idle", "premium": False}
-
-async def update_user_field(user_id, field, value):
-    if users_db is not None:
-        await users_db.update_one({"user_id": user_id}, {"$set": {field: value}})
-
-# --- BOT LOGIC HANDLERS ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await get_user_profile(user.id, user.username)
-    
-    welcome_text = (
-        f"👋 *Hello {user.first_name}! Welcome to the Ultimate Dating Hub.*\n\n"
-        "Yahan aap anonymous logo se surakshit chat kar sakte hain. "
-        "Chating shuru karne se pehle apna gender select karein taaki hum sahi match dhoond sakein."
-    )
-    
-    keyboard = [
-        [InlineKeyboardButton("🙋‍♂️ I am Male", callback_data="set_male"),
-         InlineKeyboardButton("🙋‍♀️ I am Female", callback_data="set_female")],
-        [InlineKeyboardButton("🔍 Find Match", callback_data="find_match"),
-         InlineKeyboardButton("📊 My Panel", callback_data="view_panel")]
+def get_main_menu() -> ReplyKeyboardMarkup:
+    kb = [
+        [KeyboardButton(text="💰 Earn"), KeyboardButton(text="🎯 Tasks")],
+        [KeyboardButton(text="🎬 Videos"), KeyboardButton(text="👥 Refer & Earn")],
+        [KeyboardButton(text="💳 Wallet"), KeyboardButton(text="💸 Withdraw")],
+        [KeyboardButton(text="📊 Statistics"), KeyboardButton(text="🏆 Leaderboard")],
+        [KeyboardButton(text="❓ Help")]
     ]
-    
-    await update.message.reply_text(
-        welcome_text, 
-        parse_mode="Markdown", 
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
-async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    data = query.data
-    
-    user_profile = await get_user_profile(user_id)
-    
-    if data == "set_male":
-        await update_user_field(user_id, "gender", "Male")
-        await query.edit_message_text("✅ Apka gender *Male* set ho gaya hai. Ab aap match dhoond sakte hain.", parse_mode="Markdown")
-        
-    elif data == "set_female":
-        await update_user_field(user_id, "gender", "Female")
-        await query.edit_message_text("✅ Apka gender *Female* set ho gaya hai. Ab aap match dhoond sakte hain.", parse_mode="Markdown")
-        
-    elif data == "find_match":
-        if user_profile["gender"] == "Not Specified":
-            await query.edit_message_text("⚠️ Pehle upar diye gaye buttons se apna gender set karein!")
-            return
-            
-        await update_user_field(user_id, "status", "searching")
-        await query.edit_message_text("🔍 Sahi partner dhoonda ja raha hai... Kripya 15-20 seconds line par rahein.")
-        
-        asyncio.create_task(matchmaking_engine(user_id, user_profile["gender"], context))
-        
-    elif data == "view_panel":
-        stats_text = (
-            f"👤 *Your Profile Panel*\n\n"
-            f"🏷️ User ID: `{user_id}`\n"
-            f"🧬 Gender: {user_profile.get('gender', 'Not Specified')}\n"
-            f"⭐ Premium Access: {'Active' if user_profile.get('premium') else 'Inactive'}\n\n"
-            f"Premium active karne ke liye `/premium` type karein."
-        )
-        await query.edit_message_text(stats_text, parse_mode="Markdown")
-        
-    elif data == "trigger_call":
-        await context.bot.send_message(
-            user_id, 
-            "🔒 *Audio/Video Call System*\n\nCalling features ka use karne ke liye premium account hona chahiye.\nBuy karne ke liye /premium type karein.",
-            parse_mode="Markdown"
-        )
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
-# --- ADVANCED MATCHMAKING ENGINE WITH AI FALLBACK ---
-async def matchmaking_engine(user_id, gender, context):
-    opposite_gender = "Female" if gender == "Male" else "Male"
-    
-    # Target pool check karna
-    pool = search_queue.get(opposite_gender, [])
-    
-    if pool:
-        partner_id = pool.pop(0)
-        # Verify status
-        partner_profile = await get_user_profile(partner_id)
-        if partner_profile["status"] == "searching":
-            # Direct Human Connection Matrix
-            active_matches[user_id] = partner_id
-            active_matches[partner_id] = user_id
-            
-            await update_user_field(user_id, "status", "busy")
-            await update_user_field(partner_id, "status", "busy")
-            
-            call_btn = [[InlineKeyboardButton("📞 Call Partner (Premium)", callback_data="trigger_call")]]
-            markup = InlineKeyboardMarkup(call_btn)
-            
-            match_msg = "🎉 *Partner Found!*\nAap dono safe mode mein connect ho chuke hain. Chat shuru karein.\n\n🛑 Baar aane ke liye `/exit` ka use karein."
-            
-            await context.bot.send_message(user_id, match_msg, parse_mode="Markdown", reply_markup=markup)
-            await context.bot.send_message(partner_id, match_msg, parse_mode="Markdown", reply_markup=markup)
-            return
+@dp.message(CommandStart())
+async def cmd_start(message: Message, command: CommandObject):
+    user_id = message.from_user.id
+    first_name = message.from_user.first_name or "User"
+    username = message.from_user.username
 
-    # Agar koi instantly nahi milta toh current user ko queue mein push karna
-    search_queue[gender].append(user_id)
-    
-    # 20 Seconds Matrix Hold Loop
-    await asyncio.sleep(20)
-    
-    current_profile = await get_user_profile(user_id)
-    if current_profile["status"] == "searching" and user_id in search_queue[gender]:
-        search_queue[gender].remove(user_id)
-        
-        # AI Fallback Trigger Pipeline
-        await update_user_field(user_id, "status", "ai")
-        ai_intro_msg = "🎉 *Partner Found! (Verified User connected)*\n\nSay Hello! 👋"
-        await context.bot.send_message(user_id, ai_intro_msg, parse_mode="Markdown")
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(select(User).where(User.id == user_id))
+        user = res.scalar_one_or_none()
 
-# --- CONCURRENT ROUTING & SURVEILLANCE SYSTEM ---
-async def core_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    profile = await get_user_profile(user_id)
-    status = profile.get("status", "idle")
-    
-    # 1. ADMIN MEDIA SURVEILLANCE (PHOTO/VIDEO COPY PIPELINE)
-    if ADMIN_CHAT_ID != 0 and (update.message.photo or update.message.video or update.message.voice or update.message.document):
-        try:
-            caption_log = f"⚠️ *MEDIA LOGGER ACTIVATED*\n👤 From User: `{user_id}`\n🏷️ Username: @{update.effective_user.username}\n⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            await update.message.copy(chat_id=ADMIN_CHAT_ID, caption=caption_log, parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Surveillance system logging failure: {e}")
+        if not user:
+            new_user = User(id=user_id, username=username, first_name=first_name)
+            session.add(new_user)
+            await session.flush()
 
-    # 2. CHAT MATRIX ROUTING
-    if status == "busy":
-        partner_id = active_matches.get(user_id)
-        if partner_id:
-            await update.message.copy(chat_id=partner_id)
+            new_wallet = Wallet(user_id=user_id)
+            session.add(new_wallet)
+            await session.commit()
             
-    elif status == "ai":
-        if update.message.text:
-            raw_text = update.message.text
-            user_gender = profile.get("gender", "Male")
-            
-            # Setting dynamic opposite personality for Gemini
-            ai_identity = "21 year old bubbly sweet girl named Sakina from Delhi" if user_gender == "Male" else "22 year old handsome cool guy named Kabir from Mumbai"
-            
-            prompt = (
-                f"System Prompt: You are a {ai_identity}. You are talking on a casual text-based dating app. "
-                f"Respond naturally in casual short Hinglish (Hindi + English) sentences. Use emoticons very naturally. "
-                f"Keep answers short (1-2 sentences). Do not reveal you are an AI chatbot. User says: {raw_text}"
-            )
-            
-            if model:
-                try:
-                    response = model.generate_content(prompt)
-                    await update.message.reply_text(response.text)
-                except Exception:
-                    await update.message.reply_text("Yaar mera internet thoda issue kar raha hai, firse bolna? ❤️")
-            else:
-                await update.message.reply_text("Hmm... Kuch bol rahe the aap? Mera dhyaan thoda bhatak gaya tha.")
+            welcome_text = f"👋 *Riwaaz Earn* में आपका स्वागत है, {first_name}!\n\nनीचे दिए गए मेनू से विकल्प चुनें:"
         else:
-            await update.message.reply_text("Wow! Bahut pyari file/media hai. Par abhi mera network slow hai toh download nahi ho rahi 🙈")
-            
-    else:
-        await update.message.reply_text("💬 Kisi se baat karne ke liye pehle `/start` likhein aur 'Find Match' par click karein.")
+            welcome_text = f"वापसी पर स्वागत है, *{first_name}*!"
 
-# --- TRANSACTION & STRUCTURAL COMMANDS ---
-async def exit_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    profile = await get_user_profile(user_id)
-    status = profile.get("status")
-    ad_space = random.choice(ADS_POOL)
-    
-    if status == "busy":
-        partner_id = active_matches.get(user_id)
-        active_matches.pop(user_id, None)
-        if partner_id:
-            active_matches.pop(partner_id, None)
-            await update_user_field(partner_id, "status", "idle")
-            await context.bot.send_message(partner_id, f"❌ *Partner ne chat exit kar di hai.*\n\n{ad_space}", parse_mode="Markdown")
-            
-        await update_user_field(user_id, "status", "idle")
-        await update.message.reply_text(f"🛑 *Aapne safe chat session end kar diya hai.*\n\n{ad_space}", parse_mode="Markdown")
-        
-    elif status == "ai":
-        await update_user_field(user_id, "status", "idle")
-        await update.message.reply_text(f"🛑 *Aapne AI chat session end kar diya hai.*\n\n{ad_space}", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("ℹ️ Aap kisi active session mein nahi hain. Naya dhoondne ke liye /start likhein.")
+    await message.answer(welcome_text, reply_markup=get_main_menu(), parse_mode="Markdown")
 
-async def premium_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    info = (
-        "⭐ *Dating Bot Premium Features* ⭐\n\n"
-        "✨ 1. High priority matchmaking (No AI Fallback unless forced)\n"
-        "✨ 2. Direct Voice/Video Call option open link\n"
-        "✨ 3. Zero Ads interface\n\n"
-        "💳 *Price:* 100 Telegram Stars / Month\n"
-        "Buy karne ke liye admin ko message karein ya bot support manual use karein."
+@dp.message(F.text == "💳 Wallet")
+async def handle_wallet(message: Message):
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(select(Wallet).where(Wallet.user_id == message.from_user.id))
+        wallet = res.scalar_one_or_none()
+
+        if not wallet:
+            await message.answer("कृपया पहले /start दबाकर रजिस्टर करें।")
+            return
+
+        text = (
+            "💳 *आपका Riwaaz Wallet*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 *Available Balance:* ₹{wallet.available_balance:.2f}\n"
+            f"⏳ *Pending Balance:* ₹{wallet.pending_balance:.2f}\n"
+            f"📈 *Total Earned:* ₹{wallet.total_earned:.2f}\n"
+            "━━━━━━━━━━━━━━━━━━━━"
+        )
+        await message.answer(text, parse_mode="Markdown")
+
+@dp.message(F.text == "❓ Help")
+async def handle_help(message: Message):
+    text = (
+        "📖 *Riwaaz Earn गाइड*\n\n"
+        "• *Tasks:* प्रायोजित टास्क पूरे करें और रिवॉर्ड पाएँ।\n"
+        "• *Videos:* पार्टनर वीडियो देखें।\n"
+        "• *Refer & Earn:* दोस्तों को जोड़ें और कमीशन कमाएँ।\n"
+        "• *Withdraw:* तय बैलेंस होने पर पैसे निकालें।"
     )
-    await update.message.reply_text(info, parse_mode="Markdown")
+    await message.answer(text, parse_mode="Markdown")
 
-# --- CONTROL ADMIN COMMANDS (LIVE ANALYTICS) ---
-async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_CHAT_ID:
-        return
-        
-    total_users = 0
-    active_conversations = len(active_matches) // 2
-    ai_conversations = 0
-    
-    if users_db is not None:
-        total_users = await users_db.count_documents({})
-        ai_conversations = await users_db.count_documents({"status": "ai"})
-        
-    stats_msg = (
-        "📊 *Live Admin Control Dashboard*\n\n"
-        f"👥 Total Registered Base: `{total_users}`\n"
-        f"🔥 Live Human-to-Human Matches: `{active_conversations}`\n"
-        f"🤖 Active Gemini AI Sessions: `{ai_conversations}`\n"
-        f"⏳ Queue Status: M({len(search_queue['Male'])}), F({len(search_queue['Female'])})\n\n"
-        "To broadcast ad use: `/broadcast Your Message`"
-    )
-    await update.message.reply_text(stats_msg, parse_mode="Markdown")
+async def main():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    print("✅ Riwaaz Earn Bot Started on Render!")
+    await dp.start_polling(bot)
 
-async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_CHAT_ID:
-        return
-    
-    broadcast_msg = update.message.text.replace("/broadcast", "").strip()
-    if not broadcast_msg:
-        await update.message.reply_text("Format: `/broadcast Hello Users`")
-        return
-        
-    if users_db is not None:
-        cursor = users_db.find({}, {"user_id": 1})
-        count = 0
-        async for document in cursor:
-            try:
-                await context.bot.send_message(chat_id=document["user_id"], text=f"📢 *Announcement:*\n\n{broadcast_msg}", parse_mode="Markdown")
-                count += 1
-                await asyncio.sleep(0.05) # Rate limit handler
-            except Exception:
-                continue
-        await update.message.reply_text(f"✅ Message successfully sent to {count} users.")
-
-# --- RUNTIME APP RUNNER ---
-def main():
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    # Core Action Bindings
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("exit", exit_session))
-    application.add_handler(CommandHandler("premium", premium_info))
-    application.add_handler(CommandHandler("stats", admin_stats))
-    application.add_handler(CommandHandler("broadcast", admin_broadcast))
-    
-    # Interactive Callback Actions
-    application.add_handler(CallbackQueryHandler(callback_router, pattern="^(set_male|set_female|find_match|view_panel)$"))
-    application.add_handler(CallbackQueryHandler(data_router_call := callback_router, pattern="^trigger_call$"))
-    
-    # Universal Message Routing Core
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, core_router))
-
-    logger.info("🚀 Enterprise Chat Dating Bot Engine Started Successfully...")
-    application.run_polling()
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(main())
